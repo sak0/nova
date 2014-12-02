@@ -20,9 +20,13 @@ from nova.api.openstack.compute.views import images as views_images
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
+from nova import compute
 import nova.image.glance
 from nova.openstack.common.gettextutils import _
+from nova.openstack.common import log as logging
 import nova.utils
+
+LOG = logging.getLogger(__name__)
 
 
 SUPPORTED_FILTERS = {
@@ -96,6 +100,7 @@ class Controller(wsgi.Controller):
 
         """
         super(Controller, self).__init__(**kwargs)
+        self.compute_api = compute.API()
         self._image_service = (image_service or
                                nova.image.glance.get_default_image_service())
 
@@ -208,6 +213,16 @@ class Controller(wsgi.Controller):
 
     def create(self, *args, **kwargs):
         raise webob.exc.HTTPMethodNotAllowed()
+
+    def image_capacity(self, req, id):
+        #context = req.environ['nova.context']
+        try:
+            stor_info = self.compute_api.image_capacity()
+        except Exception, e:
+            LOG.error(e)
+            msg = "can't get image storage info."
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        return stor_info
 
 
 def create_resource():

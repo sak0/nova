@@ -50,3 +50,5 @@ SHELVED_OFFLOADED = 'shelved_offloaded'  # VM and associated resources are
 ALLOW_SOFT_REBOOT = [ACTIVE]  # states we can soft reboot from
 ALLOW_HARD_REBOOT = ALLOW_SOFT_REBOOT + [STOPPED, PAUSED, SUSPENDED, ERROR]
 # states we allow hard reboot from
+
+RESTORE_TO_HOST = 'restore-to-host'

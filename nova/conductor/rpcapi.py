@@ -434,6 +434,11 @@ class ConductorAPI(object):
         return cctxt.call(context, 'object_backport', objinst=objinst,
                           target_version=target_version)
 
+    def backup2_status_update(self, context, host, backup_id, values):
+        cctxt = self.client.prepare(version='1.50')
+        return cctxt.call(context, 'backup2_status_update',
+                          backup_id=backup_id, values=values, host=host)
+
 
 class ComputeTaskAPI(object):
     """Client side of the conductor 'compute' namespaced RPC API
@@ -493,3 +498,17 @@ class ComputeTaskAPI(object):
     def unshelve_instance(self, context, instance):
         cctxt = self.client.prepare(version='1.3')
         cctxt.cast(context, 'unshelve_instance', instance=instance)
+
+    def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
+            image_ref, orig_image_ref, orig_sys_metadata, bdms,
+            recreate=False, on_shared_storage=False, host=None,
+            preserve_ephemeral=False, kwargs=None):
+        cctxt = self.client.prepare(version='1.5')
+        cctxt.cast(ctxt, 'rebuild_instance',
+                   instance=instance, new_pass=new_pass,
+                   injected_files=injected_files, image_ref=image_ref,
+                   orig_image_ref=orig_image_ref,
+                   orig_sys_metadata=orig_sys_metadata, bdms=bdms,
+                   recreate=recreate, on_shared_storage=on_shared_storage,
+                   preserve_ephemeral=preserve_ephemeral,
+                   host=host)

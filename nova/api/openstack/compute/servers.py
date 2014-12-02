@@ -1497,6 +1497,211 @@ class Controller(wsgi.Controller):
                 'ip', 'changes-since', 'all_tenants')
 
 
+    @wsgi.response(200)
+    def check_disable_compute_node(self, req, id, body):
+        context = req.environ['nova.context']
+        host = body.get("hostname")
+        check_status = body.get("check_status")
+        if 'hostname' in body:
+            if not host:
+                msg =  {"message" : "can't find the host for hostname %s" % host}
+                raise exc.HTTPNotFound(explanation=msg)
+        else :
+            msg =  {"message" : "please input hostname"}
+            raise exc.HTTPNotFound(explanation=msg)
+
+        if 'check_status' not in body:
+            msg =  {"message" : "please input check_status,default check_status=False"}
+            raise exc.HTTPNotFound(explanation=msg)
+
+        try:
+            LOG.info("check_disable_compute_node_1::::::::::::")
+            self.compute_api.check_disable_compute_node(context, host, check_status)
+        except exception.ComputeServiceUnavailable as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+
+    @wsgi.response(200)
+    def check_enable_compute_node(self, req, id, body):
+        context = req.environ['nova.context']
+        host = body.get("hostname")
+        if 'hostname' in body:
+            if not host:
+                msg =  {"message" : "can't find the host for hostname %s" % hostname}
+                raise exc.HTTPNotFound(explanation=msg)
+        else :
+            msg =  {"message" : "please input hostname"}
+            raise exc.HTTPNotFound(explanation=msg)
+
+        try:
+            self.compute_api.check_enable_compute_node(context, host)
+        except exception.ComputeServiceUnavailable as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+
+    def add_compute_node(self, req, id, body):
+        ip = body.get("ip")
+        if 'ip' in body:
+            if not ip:
+                msg =  {"message" : "can't find the host for ip %s" % ip}
+                raise exc.HTTPNotFound(explanation=msg)
+        else :
+            msg =  {"message" : "please input ip"}
+            raise exc.HTTPNotFound(explanation=msg)
+
+        context = req.environ['nova.context']
+        host = utils.get_hostname(ip)
+        if not host:
+            msg =  {"message" : "can't find the host by ip %s" % ip}
+            raise exc.HTTPNotFound(explanation=msg)
+
+        try:
+            en_flag = self.compute_api.check_enable_compute_node(context, host)
+        except exception.ComputeServiceUnavailable as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+        LOG.info("add_compute_node_1::::::::::")
+        return self.compute_api.get_host_info(context, host)
+    
+    @wsgi.response(202)
+    def change_admin_password(self, req, id, body):
+        if (not 'admin_pass' in body):
+            msg = _("No adminPass was specified")
+            raise exc.HTTPBadRequest(explanation=msg)
+        context = req.environ['nova.context']
+        admin_pass = body["admin_pass"]
+        if not isinstance(admin_pass, basestring):
+            msg = _("Invalid adminPass")
+            raise exc.HTTPBadRequest(explanation=msg)
+        instance = self.compute_api.get(context, id)
+        try:
+            self.compute_api.change_admin_password(context, instance, admin_pass)
+        except exception.InstanceInvalidState as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+        except exception.InstanceIsLocked as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+
+    @wsgi.response(202)
+    def update_metadata(self, req, id, body):
+        if (not 'metadata' in body):
+            msg = _("No metadata was specified")
+            raise exc.HTTPBadRequest(explanation=msg)
+        context = req.environ['nova.context']
+        metadata = body["metadata"]
+        if not isinstance(metadata, dict):
+            msg = _("Invalid metadata")
+            raise exc.HTTPBadRequest(explanation=msg)
+        instance = self.compute_api.get(context, id)
+        try:
+            self.compute_api.update_metadata(context, instance, metadata)
+        except exception.InstanceInvalidState as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+        except exception.InstanceIsLocked as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+
+    @wsgi.response(202)
+    def backup2_instance(self, req, id, body):
+        context = req.environ['nova.context']
+        instance = self.compute_api.get(context, id)
+        name = body["name"]
+        #description = body.get('description', None)
+        LOG.debug(_('backup create'), instance=instance)
+        return self.compute_api.backup2_instance(context, instance, name, 
+                None)
+        
+    @wsgi.response(202)
+    def backup2_resume_instance(self, req, id, body):
+        context = req.environ['nova.context']
+        instance = self._get_server(context, req, id)
+        backup_id = body["id"]
+        LOG.debug(_('backup resume'), instance=instance)
+        try:
+            self.compute_api.backup2_resume_instance(context, instance, 
+                                                       backup_id)
+        except exception.Invalid:
+            msg = _("Invalid backup instance.")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+    def backup2_list(self, req, id):
+        context = req.environ['nova.context']
+        instance = self.compute_api.get(context, id)
+        LOG.debug(_('backup list'), instance=instance)
+        return self.compute_api.backup2_list(context, instance)
+
+    def backup2_show(self, req, id):
+        context = req.environ['nova.context']
+        backup_id = req.environ['QUERY_STRING'].split('=')[-1]
+        LOG.debug(_('backup show'))
+        return self.compute_api.backup2_show(context, backup_id)
+
+    def backup2_rename(self, req, id, body):
+        context = req.environ['nova.context']
+        backup_id = body['id']
+        name = body['name']
+        LOG.debug(_('backup rename {backup_id}'.format(backup_id=backup_id)))
+        return self.compute_api.backup2_rename(context, backup_id, name)
+
+    @wsgi.response(202)
+    def backup2_delete(self, req, id, body):
+        context = req.environ['nova.context']
+        backup_id = body['id']
+        LOG.debug(_('backup delete'), backup_id=backup_id)
+        return self.compute_api.backup2_delete(context, backup_id)
+
+    @wsgi.response(202)    
+    def backup2_to_image(self, req, id, body):
+        context = req.environ['nova.context']
+
+        entity = body.get("createImage", {})
+        image_name = entity.get("name")
+        backup_id = entity.get("backup_id")
+
+        if not image_name:
+            msg = _("createImage entity requires name attribute")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        props = {}
+        metadata = entity.get('metadata', {})
+        common.check_img_metadata_properties_quota(context, metadata)
+        try:
+            props.update(metadata)
+        except ValueError:
+            msg = _("Invalid metadata")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        try:
+            image = self.compute_api.backup2_to_image(context, req,
+                                                      backup_id,
+                                                      image_name,
+                                                      extra_properties=props)
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                                                                  'createImage')
+        except exception.Invalid as err:
+            raise exc.HTTPBadRequest(explanation=err.format_message())
+
+        # build location of newly-created image entity
+        image_id = str(image['id'])
+        image_ref = os.path.join(req.application_url,
+                                 context.project_id,
+                                 'images',
+                                 image_id)
+
+        resp = webob.Response(status_int=202)
+        resp.headers['Location'] = image_ref
+        return {'image_id': image_id}
+
+    def compute_node_info(self, req, id):
+        host = req.environ['QUERY_STRING'].split('=')[-1]
+        if not host:
+            msg = _("invalid hostname.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        context = req.environ['nova.context']
+        try:
+            nodeinfo = self.compute_api.get_host_info(context, host)
+        except Exception:
+            msg = _("get_node_info failed.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        return nodeinfo
+
+
 def create_resource(ext_mgr):
     return wsgi.Resource(Controller(ext_mgr))
 

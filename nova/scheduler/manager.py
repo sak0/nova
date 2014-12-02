@@ -30,13 +30,16 @@ from nova.conductor import api as conductor_api
 from nova.conductor.tasks import live_migrate
 from nova import exception
 from nova import manager
+from nova import compute
 from nova.objects import instance as instance_obj
 from nova.openstack.common import excutils
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import periodic_task
+from nova.openstack.common.gettextutils import _
 from nova import quota
+from nova import servicegroup
 from nova.scheduler import utils as scheduler_utils
 
 
@@ -53,6 +56,13 @@ scheduler_driver_opts = [
                     'Please note this is likely to interact with the value '
                     'of service_down_time, but exactly how they interact '
                     'will depend on your choice of scheduler driver.'),
+    cfg.IntOpt('scheduler_ha_task_period',
+               default=60,
+               help='How often (in seconds) to run periodic tasks in '
+                    'for vm ha detect.'),
+    cfg.BoolOpt('scheduler_ha_task_enable',
+               default=False,
+               help='enable vm ha'),
 ]
 CONF = cfg.CONF
 CONF.register_opts(scheduler_driver_opts)
@@ -73,6 +83,9 @@ class SchedulerManager(manager.Manager):
         super(SchedulerManager, self).__init__(service_name='scheduler',
                                                *args, **kwargs)
         self.additional_endpoints.append(_SchedulerManagerV3Proxy(self))
+        self.servicegroup_api = servicegroup.API()
+        self.host_api = compute.HostAPI()
+        self.compute_api = compute.API()
 
     def create_volume(self, context, volume_id, snapshot_id,
                       reservations=None, image_id=None):
@@ -297,6 +310,31 @@ class SchedulerManager(manager.Manager):
         dests = self.driver.select_destinations(context, request_spec,
             filter_properties)
         return jsonutils.to_primitive(dests)
+    
+    @periodic_task.periodic_task(spacing=CONF.scheduler_ha_task_period,
+                                 run_immediately=True)
+    def _run_ha_tasks(self, context):
+        if not CONF.scheduler_ha_task_enable:
+            LOG.info("[ha_task] ha task not enable. Skip.")
+            return
+        elevated = context.elevated()
+        host_state = self.driver._get_all_host_states(elevated)
+        hosts = list(host_state)
+        for host in hosts:
+            service = host.service
+            if not self.servicegroup_api.service_is_up(service):
+                instances = self.host_api.instance_get_all_by_host(context, host.host)
+                LOG.warn(_("[ha_task] %s has not been heard from in a while"), host.host)
+                LOG.warn(_("[ha_task] find %d instances on the lost host, u can see them in log for debug mode"), len(instances))
+                for instance in instances:
+                    LOG.warn(_("[ha_task] find instance should be rebuild: %{instance_uuid}s vm_state=%{vm_state}s"),
+                              {'instance_uuid': instance['uuid'], 'vm_state':instance['vm_state']})
+                    LOG.debug(instance)
+                    if instance['vm_state'] in ["active", "stopped"]:
+                        try:
+                            self.compute_api.evacuate(context, instance, host = None, on_shared_storage = True)
+                        except Exception,e:
+                            LOG.error(e)
 
 
 class _SchedulerManagerV3Proxy(object):

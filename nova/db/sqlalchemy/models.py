@@ -1395,3 +1395,19 @@ class PciDevice(BASE, NovaBase):
                             primaryjoin='and_('
                             'PciDevice.instance_uuid == Instance.uuid,'
                             'PciDevice.deleted == 0)')
+
+class Backup2(BASE, NovaBase):
+
+    __tablename__ = 'backup2'
+    id = Column(String(36), primary_key=True)
+
+    image_ref = Column(String(255))
+    instance_uuid = Column(String(255))
+    backup_time = Column(String(255))
+    backup_path = Column(String(255))
+    backup_size = Column(String(255))
+
+    backup_status = Column(String(255))
+
+    display_name = Column(String(255))
+    display_description = Column(String(255))

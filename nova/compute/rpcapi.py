@@ -968,6 +968,83 @@ class ComputeAPI(object):
         cctxt.cast(ctxt, 'external_instance_event', instances=instances,
                    events=events)
 
+    def check_enable_compute_node(self, ctxt, host):
+        cctxt = self.client.prepare(server=host)
+        return cctxt.call(ctxt, 'check_enable_compute_node',host=host)
+    
+    def change_admin_password(self, ctxt, instance, admin_pass):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'change_admin_password', instance=instance_p,
+                   admin_pass=admin_pass)
+
+    def get_host_info(self, ctxt, host):
+        cctxt = self.client.prepare(server=_compute_host(host, None))
+        return cctxt.call(ctxt, 'get_host_info')
+
+    def change_admin_password(self, ctxt, instance, admin_pass):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'change_admin_password', instance=instance_p,
+                   admin_pass=admin_pass)
+
+    def update_metadata(self, ctxt, instance, metadata):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'update_metadata',
+                   instance=instance_p, metadata=metadata)
+
+    def backup2_instance_easy(self, ctxt, instance, bak_info):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'backup2_instance_easy', instance=instance_p,
+                   bak_info=bak_info)
+
+    def backup2_resume_instance(self, ctxt, instance, bak_info):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'backup2_resume_instance', instance=instance_p,
+                   bak_info=bak_info)      
+
+    def backup2_delete(self, ctxt, instance, bak_info):
+        instance_p = jsonutils.to_primitive(instance)
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'backup2_delete', instance=instance_p,
+                   bak_info=bak_info)
+        
+    def backup2_to_image(self, ctxt, instance, bak_info, image_id):
+        if self.client.can_send_version('2.42'):
+            version = '2.42'
+            extra_kwargs = dict()
+        else:
+            instance = jsonutils.to_primitive(
+                    objects_base.obj_to_primitive(instance))
+            extra_kwargs = dict(image_type='snapshot',
+                                backup_type=None,
+                                rotation=None)
+            version = '2.0'
+        cctxt = self.client.prepare(server=_compute_host(None, instance))
+        cctxt.cast(ctxt, 'backup2_to_image',
+                   instance=instance,
+                   bak_info=bak_info,
+                   image_id=image_id,
+                   **extra_kwargs)
+
+    def quick_resize_instance(self, ctxt, instance, 
+                            instance_type, reservations=None):
+        version = '3.6'
+        if not self.client.can_send_version(version):
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.44')
+        instance = jsonutils.to_primitive(
+                    objects_base.obj_to_primitive(instance))
+        instance_type_p = jsonutils.to_primitive(instance_type)
+        cctxt = self.client.prepare(server=_compute_host(None, instance),
+                                    version=version)
+        cctxt.cast(ctxt, 'quick_resize_instance',
+                   instance=instance, reservations=reservations,
+                   instance_type=instance_type_p)
+
 
 class SecurityGroupAPI(object):
     '''Client side of the security group rpc API.

@@ -1556,3 +1556,9 @@ class InvalidWatchdogAction(Invalid):
 class NoBlockMigrationForConfigDriveInLibVirt(NovaException):
     msg_fmt = _("Block migration of instances with config drives is not "
                 "supported in libvirt.")
+
+class ComputeNodeInstanceExists(ServiceUnavailable):
+    msg_fmt = _("The Compute node has some instances,it is expected not to exists.")
+
+class ComputeServiceIsEnable(ServiceUnavailable):
+    msg_fmt = _("Compute service of %(host)s is in already available at this time.")

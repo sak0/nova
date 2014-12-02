@@ -1923,3 +1923,21 @@ def archive_deleted_rows_for_table(context, tablename, max_rows=None):
     """
     return IMPL.archive_deleted_rows_for_table(context, tablename,
                                                max_rows=max_rows)
+
+def backup2_create(context, values):
+    return IMPL.backup2_create(context, values)
+
+def backup2_destroy(context, backup_id):
+    return IMPL.backup2_destroy(context, backup_id)
+
+def backup2_get(context, backup_id):
+    return IMPL.backup2_get(context, backup_id)
+
+def backup2_get_by_instance_uuid(context, uuid):
+    return IMPL.backup2_get_by_instance_uuid(context, uuid)
+
+def backup2_get_all(context):
+    return IMPL.backup2_get_all(context)
+
+def backup2_update(context, backup_id, values):
+    return IMPL.backup2_update(context, backup_id, values)

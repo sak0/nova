@@ -33,6 +33,7 @@ import sys
 import time
 import traceback
 import uuid
+import json
 
 import eventlet.event
 from eventlet import greenthread
@@ -1530,7 +1531,7 @@ class ComputeManager(manager.Manager):
                         macs=macs,
                         security_groups=security_groups,
                         dhcp_options=dhcp_options)
-                LOG.debug(_('Instance network_info: |%s|'), nwinfo,
+                LOG.info(_('Instance network_info: |%s|'), nwinfo,
                           instance=instance)
                 # NOTE(alaski): This can be done more cleanly once we're sure
                 # we'll receive an object.
@@ -1789,12 +1790,12 @@ class ComputeManager(manager.Manager):
 
     def _notify_about_instance_usage(self, context, instance, event_suffix,
                                      network_info=None, system_metadata=None,
-                                     extra_usage_info=None, fault=None):
+                                     extra_usage_info=None, fault=None, backup_uuid=None):
         compute_utils.notify_about_instance_usage(
             self.notifier, context, instance, event_suffix,
             network_info=network_info,
             system_metadata=system_metadata,
-            extra_usage_info=extra_usage_info, fault=fault)
+            extra_usage_info=extra_usage_info, fault=fault, backup_uuid=backup_uuid)
 
     def _deallocate_network(self, context, instance,
                             requested_networks=None):
@@ -2556,8 +2557,7 @@ class ComputeManager(manager.Manager):
                 attach_block_devices=self._prep_block_device,
                 block_device_info=block_device_info,
                 network_info=network_info,
-                preserve_ephemeral=preserve_ephemeral,
-                recreate=recreate)
+                preserve_ephemeral=preserve_ephemeral)
             try:
                 self.driver.rebuild(**kwargs)
             except NotImplementedError:
@@ -5735,3 +5735,301 @@ class ComputeManager(manager.Manager):
                     instance.cleaned = True
                 with utils.temporary_mutation(context, read_deleted='yes'):
                     instance.save(context)
+
+    @wrap_exception()
+    def check_enable_compute_node(self, context, host=None):
+        """Reboots, shuts down or powers up the host."""
+        return self.driver.check_enable_compute_node(context,host)
+    
+    @wrap_exception()
+    def get_host_info(self, context):
+        """Returns the result of host information"""
+        return self.driver.get_host_info()
+
+    @wrap_exception()
+    @reverts_task_state
+    def change_admin_password(self, context, instance, admin_pass):
+        """Set the root/admin password for an instance on this host.
+
+        This is generally only called by API password resets after an
+        image has been built.
+        """
+
+        context = context.elevated()
+
+        max_tries = 10
+
+        for i in xrange(max_tries):
+            current_power_state = self._get_power_state(context, instance)
+            expected_state = power_state.SHUTDOWN
+
+            if current_power_state != expected_state:
+                self._instance_update(context, instance['uuid'], task_state=None,
+                                      expected_task_state=task_states.UPDATING_PASSWORD)
+                _msg = _('Failed to set admin password. Instance %s is '
+                         ' running') % instance["uuid"]
+                raise exception.InstancePasswordSetFailed(
+                    instance=instance['uuid'], reason=_msg)
+            else:
+                if instance.get("os_type", None) and instance["os_type"][:7] == "windows":
+                    if instance["os_type"] == "windows_2003":
+                        path = "WINDOWS/system32/GroupPolicy/Machine/Scripts/Startup/CrPW.cmd"
+                        partition = 1
+                    else:
+                        path = "Windows/System32/GroupPolicy/Machine/Scripts/Startup/CrPW.cmd"
+                        partition = 2
+
+                    files = []
+
+                    contents = ("Net user administrator {0}\r\n"
+                                "del {1}\r\n".format(admin_pass, '%0'))
+
+                    files.append((path, contents))
+                    try:
+                        self.driver.change_admin_password_win(instance, admin_pass, files, partition)
+                        LOG.audit(_("Root password set for windows guestos"), instance=instance)
+                        self._instance_update(context, instance['uuid'],
+                                              task_state=None,
+                                              expected_task_state=task_states.UPDATING_PASSWORD)
+                        break
+                    except NotImplementedError:
+                        # NOTE(dprince): if the driver doesn't implement
+                        # set_admin_password we break to avoid a loop
+                        _msg = _('set_admin_password is not implemented '
+                                 'by this driver.')
+                        LOG.warn(_msg, instance=instance)
+                        self._instance_update(context, instance['uuid'],
+                                              task_state=None,
+                                              expected_task_state=task_states.UPDATING_PASSWORD)
+                        raise exception.InstancePasswordSetFailed(
+                            instance=instance['uuid'], reason=_msg)
+                    except exception.UnexpectedTaskStateError:
+                        # interrupted by another (most likely delete) task
+                        # do not retry
+                        raise
+                    except Exception, e:
+                    # Catch all here because this could be anything.
+                        LOG.exception(_('set_admin_password failed: %s') % e,
+                                      instance=instance)
+                        if i == max_tries - 1:
+                            self._set_instance_error_state(context,
+                                                           instance['uuid'])
+                        # We create a new exception here so that we won't
+                        # potentially reveal password information to the
+                        # API caller.  The real exception is logged above
+                            _msg = _('error setting admin password')
+                            raise exception.InstancePasswordSetFailed(
+                                instance=instance['uuid'], reason=_msg)
+                            time.sleep(1)
+                            continue
+                else:
+                    try:
+                        self.driver.change_admin_password(instance, admin_pass)
+                        LOG.audit(_("Root password set for linux guestos"), instance=instance)
+                        self._instance_update(context, instance['uuid'],
+                                              task_state=None,
+                                              expected_task_state=task_states.UPDATING_PASSWORD)
+                        break
+                    except NotImplementedError:
+                    # NOTE(dprince): if the driver doesn't implement
+                    # set_admin_password we break to avoid a loop
+                        _msg = _('set_admin_password is not implemented '
+                                 'by this driver.')
+                        LOG.warn(_msg, instance=instance)
+                        self._instance_update(context, instance['uuid'],
+                                task_state=None,
+                                expected_task_state=task_states.UPDATING_PASSWORD)
+                        raise exception.InstancePasswordSetFailed(
+                            instance=instance['uuid'], reason=_msg)
+                    except exception.UnexpectedTaskStateError:
+                    # interrupted by another (most likely delete) task
+                    # do not retry
+                        raise
+                    except Exception, e:
+                    # Catch all here because this could be anything.
+                        LOG.exception(_('set_admin_password failed: %s') % e,
+                                  instance=instance)
+                        if i == max_tries - 1:
+                            self._set_instance_error_state(context,
+                                                       instance['uuid'])
+                        # We create a new exception here so that we won't
+                        # potentially reveal password information to the
+                        # API caller.  The real exception is logged above
+                            _msg = _('error setting admin password')
+                            raise exception.InstancePasswordSetFailed(
+                                instance=instance['uuid'], reason=_msg)
+                        time.sleep(1)
+                        continue
+    @object_compat
+    @wrap_exception()
+    def update_metadata(self, context, instance, metadata):
+        """Starting an instance on this host."""
+        self._notify_about_instance_usage(context, instance, "update_metadata.start")
+        try:
+            disk_info = self.driver.update_metadata(context, instance, 
+                        metadata)
+        except Exception, e:
+                    # Catch all here because this could be anything.
+                    LOG.exception(_('update_metadata failed: %s') % e,
+                                  instance=instance)
+        self._notify_about_instance_usage(context, instance, "update_metadata.end")
+        
+    @reverts_task_state
+    def backup2_instance_easy(self, context, instance, bak_info):
+        context = context.elevated()
+        LOG.audit(_('instance backup2'), context=context,
+                  instance=instance)
+        self._notify_about_instance_usage(
+                context, instance, "backup2.start")
+        bak_info_l = json.loads(bak_info)
+        backup_id = bak_info_l['id']
+            
+        LOG.info('backup_two_instance_easy() Beginning.')
+        task_state = task_states.BACKUP_DISK
+        self._instance_update(context, instance['uuid'],
+                              task_state=task_state,
+                              expected_task_state=None)
+        values = {'backup_status': 'saving',
+                      'backup_size': 0,}
+        
+        self.conductor_api.backup2_status_update(context, instance, backup_id, values)
+        res = None
+        try:
+            res = self.driver.backup2_instance(instance, bak_info_l)
+        except Exception as e:
+            LOG.error(e)
+            LOG.exception(_('Failed to backup instance'),
+                              instance=instance)
+            values = {'backup_status': 'error'}
+            self.conductor_api.backup2_status_update(context, instance, backup_id, values)
+            return
+        
+        if res:
+            values = {'backup_status': 'active',
+                      'backup_size': res['size'],
+                      'backup_path': res['path']}
+            LOG.info('backup_two_instance_easy() Successful.')
+        else:
+            values = {'backup_status': 'error'}
+            LOG.info('backup_two_instance_easy() Error.')
+
+        self.conductor_api.backup2_status_update(context, instance, backup_id, values)
+        self._instance_update(context, instance['uuid'],
+                              task_state=None,
+                              expected_task_state=task_states.BACKUP_DISK)
+        instance['backup_uuid'] = backup_id
+        self._notify_about_instance_usage(
+                context, instance, "backup2.end", backup_uuid=backup_id)
+
+    @reverts_task_state
+    def backup2_resume_instance(self, context, instance, bak_info):
+        """Resuming an instance with its backup."""
+        self._notify_about_instance_usage(context, instance, "backup2_resume.start")
+        context = context.elevated()
+        LOG.audit(_('Resuming'), context=context, instance=instance)
+        # stop the instance
+        LOG.info('++ begin power off instance ++')
+        self.driver.power_off(instance)
+        current_power_state = self._get_power_state(context, instance)
+        instance = self._instance_update(context, instance['uuid'],
+                power_state=current_power_state,
+                vm_state=vm_states.STOPPED,
+                expected_task_state=None,
+                task_state=task_states.BACKUP_RESUME)
+        
+        # resume the instance
+        try:
+            self.driver.backup2_resume_instance(context, instance, bak_info)
+        except Exception,e :
+            LOG.error(e)
+            current_power_state = self._get_power_state(context, instance)
+            instance = self._instance_update(context, instance['uuid'],
+                power_state=current_power_state,
+                vm_state=vm_states.ERROR,
+                expected_task_state=task_states.BACKUP_RESUME,
+                task_state=None)
+            self._notify_about_instance_usage(context, instance, "restore.error")
+            return
+            
+        self._power_on(context, instance)
+        current_power_state = self._get_power_state(context, instance)
+        instance = self._instance_update(context, instance['uuid'],
+                power_state=current_power_state,
+                vm_state=vm_states.ACTIVE,
+                expected_task_state=task_states.BACKUP_RESUME,
+                task_state=None)
+        self._notify_about_instance_usage(context, instance, "restore.end")
+        
+        
+    @wrap_exception()
+    def backup2_delete(self, context, instance, bak_info):
+        context = context.elevated()
+        LOG.audit(_('backup2_delete() Beginning'), context=context,
+                  instance=instance)
+        self._notify_about_instance_usage(
+                context, instance, "backup2_delete.start")
+        self.driver.backup2_delete(instance, bak_info)
+        if 'id' in bak_info:
+            instance['backup_uuid'] = bak_info['id']
+        self._notify_about_instance_usage(
+                context, instance, "backup2_delete.end", backup_uuid=instance['backup_uuid'])
+
+    def backup2_to_image(self, context, instance, bak_info, image_id):
+        self._notify_about_instance_usage(context, instance, "backup2_to_image.start")
+        context = context.elevated()
+        values = {'backup_status': 'upload'}
+        backup_id = bak_info['id']
+        self.conductor_api.backup2_status_update(context, instance, backup_id, values)
+        try:
+            self.driver.backup2_to_image(context, instance, bak_info, image_id)
+        except Exception, e:
+            self._notify_about_instance_usage(context, instance, "backup2_to_image.error")
+            LOG.error(e)
+        values = {'backup_status': 'active'}
+        self.conductor_api.backup2_status_update(context, instance, backup_id, values)
+        self._notify_about_instance_usage(context, instance, "backup2_to_image.end")
+    
+    @staticmethod
+    def can_hotplug_resize(instance, instance_type):
+        #instance.vcpus > instance_type['vcpus'] or \
+        #instance.memory_mb < instance_type['memory_mb'] or \
+        #(instance.os_type != 'linux' and instance.memory_mb != instance_type['memory_mb']):
+        return False
+        
+    @object_compat
+    @wrap_exception()
+    @reverts_task_state
+    @wrap_instance_event
+    @wrap_instance_fault
+    def quick_resize_instance(self, context, instance,
+                        reservations=None, instance_type=None):
+        if not self.can_hotplug_resize(instance, instance_type):
+            with self._error_out_instance_on_exception(context, instance.uuid,
+                                                   reservations):
+                sys_meta = instance.system_metadata
+                flavors.save_flavor_info(sys_meta, instance_type, prefix='')
+                # NOTE(mriedem): Stash the old vm_state so we can set the
+                # resized/reverted instance back to the same state later.
+                vm_state = instance['vm_state']
+                LOG.info('quick_resize_instance starting vm_state: %s' % vm_state, instance=instance)
+                instance.instance_type_id = instance_type['id']
+                instance.memory_mb = instance_type['memory_mb']
+                instance.vcpus = instance_type['vcpus']
+                instance.root_gb = instance_type['root_gb']
+                instance.ephemeral_gb = instance_type['ephemeral_gb']
+                instance.system_metadata = sys_meta
+                sys_meta['old_vm_state'] = vm_state
+                instance_p = obj_base.obj_to_primitive(instance)
+                instance.save()
+
+                instance_p = obj_base.obj_to_primitive(instance)
+                
+                current_power_state = self._get_power_state(context, instance)
+                instance.power_state = current_power_state
+                if sys_meta['old_vm_state'] == vm_states.ACTIVE:
+                    self._power_on(context, instance)
+                    instance.vm_state = vm_states.ACTIVE
+                instance.task_state = None
+                instance.save(expected_task_state=task_states.RESIZE_PREP)
+            
+                self._notify_about_instance_usage(context, instance, "resize.end")

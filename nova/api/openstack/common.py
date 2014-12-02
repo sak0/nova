@@ -79,6 +79,11 @@ _STATE_MAP = {
         task_states.RESIZE_MIGRATING: 'RESIZE',
         task_states.RESIZE_MIGRATED: 'RESIZE',
         task_states.RESIZE_FINISH: 'RESIZE',
+        task_states.RESTORE_TO_HOST: 'RESTORE_TO_HOST',
+        task_states.RESTORING: 'RESTORING',
+        task_states.BACKUP_DISK: 'BACKUP_DISK',
+        task_states.BACKUP_RESUME: 'BACKUP_RESUME',
+        task_states.UPDATING_PASSWORD : 'UPDATING_PASSWORD',
     },
     vm_states.BUILDING: {
         'default': 'BUILD',

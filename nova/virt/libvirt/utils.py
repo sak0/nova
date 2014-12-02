@@ -21,6 +21,11 @@
 import errno
 import os
 import platform
+import subprocess
+import libvirt
+import re
+import statvfs
+import time
 
 from lxml import etree
 from oslo.config import cfg
@@ -713,3 +718,314 @@ def is_mounted(mount_path, source=None):
         if exc.errno == errno.ENOENT:
             LOG.info(_("findmnt tool is not installed"))
         return False
+
+class phyhost:
+    def __init__(self):
+        self.pvscan_file = "/tmp/.pvscan"      
+        self.conn = libvirt.open("qemu:///system")
+        self.dom_list = self.conn.listAllDomains(1)
+        
+    def get_host_name(self):
+        return self.conn.getHostname()
+    
+    def get_host_ip(self):
+        return socket.gethostname()
+    
+    def get_host_info(self):
+        pass
+    
+    def get_virtual_type(self):
+        if self.conn.getType() == "QEMU":
+            return 'KVM'
+        
+    def get_vm_info(self):
+        num = len(self.dom_list)
+        live = 0
+        if num:
+            for dom in self.dom_list:
+                if dom.isActive() == 1: live += 1
+        stopped = num - live
+        return {'num' : num, 'live' : live, 'stopped' : stopped}
+    
+    def get_mem_info(self):
+        p = subprocess.Popen("free -m | grep Mem", shell = True, stdout = subprocess.PIPE)
+        line = ''.join(p.stdout.readlines())
+        line = line.split()
+        tot, use, free =  line[1], line[2], line[3]
+        return {'total': tot, 'used' : use, 'free' : free}
+    
+    def get_disk_info(self):
+        vfs = os.statvfs('/')
+        available = vfs[statvfs.F_BAVAIL]*vfs[statvfs.F_BSIZE]/(1024*1024*1024)
+        capacity=vfs[statvfs.F_BLOCKS]*vfs[statvfs.F_BSIZE]/(1024*1024*1024)
+        used = capacity - available
+        return {'capacity' : capacity, 'available' : available, 'used' : used}
+    
+    def get_eth_info(self):
+        #p = subprocess.Popen("lspci | grep Eth", shell = True, stdout = subprocess.PIPE)
+        p = subprocess.Popen("lspci | grep Eth", shell = True, stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        vendor = line.split(':')[-1]
+        vendor = re.sub('^ ', '', vendor)
+        vendor = re.sub('\n', '', vendor)
+
+        eths = []
+        p = subprocess.Popen("ifconfig -a | grep eth | grep -v br", shell = True, stdout = subprocess.PIPE)
+        for line in p.stdout.readlines():
+            line = line.split()
+            dev = line[0]
+            mac = line[-1]
+            ip = []
+            ipp = subprocess.Popen("ip addr show %s |grep inet |grep eth" % dev, 
+                                   shell = True, stdout = subprocess.PIPE)
+            while True:
+                ipstr = ipp.stdout.readline().lstrip()
+                if ipstr == '' or ipstr == None:
+                    break
+                pos1 = ipstr.index(' ')
+                pos2 = ipstr.index(' ',pos1+1)
+                print ipstr
+                print pos1
+                print pos2
+                ip.append(ipstr[pos1+1:pos2])
+            
+            eth_info = {'dev' : dev, 'vendor' : vendor, 'mac' : mac, 'ip' : str(ip)}
+            eths.append(eth_info)
+        return eths
+    
+    def get_eth_info_old(self):
+        #p = subprocess.Popen("lspci | grep Eth", shell = True, stdout = subprocess.PIPE)
+        p = subprocess.Popen("lspci | grep Eth", shell = True, stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        vendor = line.split(':')[-1]
+        vendor = re.sub('^ ', '', vendor)
+        vendor = re.sub('\n', '', vendor)
+
+        eths = []
+        p = subprocess.Popen("ifconfig -a | grep eth | grep -v br", shell = True, stdout = subprocess.PIPE)
+        for line in p.stdout.readlines():
+            line = line.split()
+            dev = line[0]
+            mac = line[-1]  
+            cmd = "ifconfig " + dev + " | grep Bcast | cut -d\':\' -f2 | cut -d \' \' -f1"
+            ipp = subprocess.Popen(cmd, 
+                                   shell = True, stdout = subprocess.PIPE)
+            ip = ipp.stdout.readline()
+            ip = re.sub('\n', '', ip)
+            eth_info = {'dev' : dev, 'vendor' : vendor, 'mac' : mac, 'ip' : str(ip)}
+            eths.append(eth_info)
+        return eths
+    
+    def get_ambient_temp(self):
+        p = subprocess.Popen("ipmitool sdr | grep Ambient", shell = True, stdout = subprocess.PIPE)
+        
+    def read_cpu_usage(self): 
+        """Read the current system cpu usage from /proc/stat.""" 
+        lines = open("/proc/stat").readlines() 
+        for line in lines: 
+        #print "l = %s" % line 
+            l = line.split() 
+            if len(l) < 5: 
+                continue 
+            if l[0].startswith('cpu'): 
+                return l;
+        return {} 
+    
+    def get_cpu_info(self):
+        cmd2 = """CPU_1=$(cat /proc/stat | grep 'cpu ' | awk '{print $2" "$3" "$4" "$5" "$6" "$7" "$8}')
+                SYS_IDLE_1=$(echo $CPU_1 | awk '{print $4}')
+                Total01=$(echo $CPU_1 | awk '{printf "%.f",$1+$2+$3+$4+$5+$6+$7}')
+                sleep 0.1
+                CPU_2=$(cat /proc/stat | grep 'cpu ' | awk '{print $2" "$3" "$4" "$5" "$6" "$7" "$8}')
+                SYS_IDLE_2=$(echo $CPU_2 | awk '{print $4}')
+                Total_2=$(echo $CPU_2 | awk '{printf "%.f",$1+$2+$3+$4+$5+$6+$7}')
+                SYS_IDLE=`expr $SYS_IDLE_2 - $SYS_IDLE_1`
+                Total=`expr $Total_2 - $Total01`
+                TT=`expr $SYS_IDLE \* 100`
+                SYS_USAGE=`expr $TT / $Total`
+                SYS_Rate=`expr 100 - $SYS_USAGE`
+                echo "$SYS_Rate"
+                """
+        
+        p = subprocess.Popen(cmd2, shell = True, 
+                             stdout = subprocess.PIPE)
+        
+        line = p.stdout.readline()
+        cpu_usage = line
+        
+        p = subprocess.Popen("cat /proc/cpuinfo  | grep \'model name\'", shell = True, 
+                             stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        vendor = line.split(':')[1]
+        vendor = re.sub('\n', '', vendor)
+        
+        p = subprocess.Popen("cat /proc/cpuinfo | grep \"physical id\" | sort | uniq | wc -l", shell = True, 
+                             stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        cpus = int(line)
+        
+        p = subprocess.Popen("cat /proc/cpuinfo | grep \'core id\' | sort | uniq | wc -l", shell = True, 
+                             stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        core = int(line)
+        cores = core * cpus
+        
+        ''''p = subprocess.Popen("cat /proc/cpuinfo  | grep \'cpu cores\'", shell = True, 
+                             stdout = subprocess.PIPE)
+        for line in p.stdout.readlines():
+            num = int(line.split(':')[-1])
+            cores += num'''
+        p = subprocess.Popen("ps -eLo  pid,ppid,lwp,psr,args | grep qemu-kvm | grep -v grep | wc -l",
+                            shell = True, stdout = subprocess.PIPE)
+        used_cpu = p.stdout.readline()
+        used_cpu = re.sub('\n', '', used_cpu)
+        usage = (float(used_cpu)/float(cores)) * 100
+        
+        return {'vendor' : vendor, 'cores' : cores, 'used_cpu' : used_cpu, 'usage' : '%.2f' % int(cpu_usage)}
+    
+    def get_stor_info_old(self):
+        self.cmd = 'service iscsi status | grep Target:' 
+        print self.cmd
+        iscsi_san_list = []
+
+        for line in os.popen(self.cmd):
+            iscsi_list = []
+            ip_san = {}
+            iscsi_list = line.split(': ')
+            tmp_list = iscsi_list[1].split('\n')
+            stor_id_str = tmp_list[0]
+            print stor_id_str
+            ip_san['id'] = stor_id_str
+            ip_san['dev_id'] = ''
+            iscsi_san_list.append(ip_san)
+        
+        self.cmd='service iscsi status | grep Attached\ scsi\ disk' 
+        print self.cmd
+        i = 0
+        for line in os.popen(self.cmd):
+            dev_list = []
+            dev_list = line.split(' ')
+            dev_list = dev_list[3].split('\t\t')
+            dev_id_str = "%s" % dev_list[0]
+            print dev_id_str
+            iscsi_san_list[i]['dev_id'] = '/dev/' + str(dev_id_str)
+            print iscsi_san_list[i]['dev_id'] 
+            ############
+            # get lun size...
+            ############
+            while not os.path.isfile(self.pvscan_file):
+                time.sleep(1)
+            #while os.path.getsize(self.pvscan_file) == 0:
+            #    time.sleep(1)
+            cmd = 'cat ' + self.pvscan_file + ' | grep /dev/%s' %  (dev_id_str)
+            #cmd = '/sbin/pvscan 2>/dev/null'
+            LOG.info("*"*80)
+            LOG.info(cmd)
+            LOG.info("*"*80)
+            #lines = self.pvs.split('\n')
+            #print lines
+            fp = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE)
+            line2 = fp.stdout.readline()
+            iscsi_san_list[i]['size'] = 0
+            if line2:
+                LOG.info("*" * 80)
+                LOG.info(line2)
+                LOG.info(cmd)
+                LOG.info("*" * 80)
+                #or line in self.pvs:
+                #    print line
+                tmp_list1 = []
+                
+                p1 = line2.find('[')
+                p2 = line2.find(']')
+                
+                if p1>0 and p2>0:
+                    new_line = line2[p1+1:p2]
+                    p3 = new_line.find('/')
+                    tmp_list1 = new_line[0:p3].split()
+                    
+                    if len(tmp_list1) == 2:
+                        if tmp_list1[1].startswith('G'):
+                            pass
+                        elif tmp_list1[1].startswith('T'):
+                            tmp_list1[0] = float(tmp_list1[0]) * 1024
+                        elif tmp_list1[1].startswith('M'):
+                            tmp_list1[0] = float(tmp_list1[0]) / 1024
+                        else:
+                            tmp_list1[0] = float(tmp_list1[0]) / 1024 / 1024 
+                            
+                        dev_id_size = int(float(tmp_list1[0]))
+                        iscsi_san_list[i]['size'] = dev_id_size
+                    else:
+                        continue
+                else:
+                    continue
+            else:
+                continue    
+
+            ############
+            # get lun used...
+            ############
+            self.root_path = '/dev'
+            cmd = 'du -sh %s/%s 2>/dev/null' % (self.root_path, dev_id_str) 
+            print cmd
+            for line3 in os.popen(cmd):
+                print line3
+                dev_list = []
+                dev_list = line3.split('\t')
+                dev_id_use = dev_list[0]
+                print dev_list
+                print dev_id_use
+            iscsi_san_list[i]['storage_used'] = dev_id_use
+            iscsi_san_list[i]['type'] = "iscsi"
+            i = i + 1
+        return iscsi_san_list
+    
+    def get_type_stor_info(self):
+        return None
+    
+    def get_mount_device_id(self, path):
+        cmd = "mount |grep " + path + " | awk '{print $1}'"
+        p = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        device_str = re.sub('\n', '', line)
+        return device_str
+        
+    def get_default_stor_info(self):
+        stor_info = {}
+        stor_info['stor_type'] = 'GLUSTERFS'
+        
+        stor_info['stor_identifier'] = self.get_mount_device_id(CONF.instances_path)
+        return stor_info
+    
+    def get_stor_info(self):
+        if CONF.libvirt.images_type == "default":
+            return self.get_default_stor_info()
+        return self.get_type_stor_info(CONF.libvirt.images_type)
+               
+    def detail(self):
+        data = {}
+                
+        data['hostname'] = self.get_host_name()
+        data['cpu'] = self.get_cpu_info()
+        data['mem'] = self.get_mem_info()
+        data['disk'] = self.get_disk_info()
+        data['eth'] = self.get_eth_info()
+        data['virt_type'] = self.get_virtual_type()
+        data['vm_info'] = self.get_vm_info()
+        #data['stor'] = self.get_stor_info()
+        data['stor'] = None
+        return data
+        
+    def info(self):
+        data = {}
+                
+        data['hostname'] = self.get_host_name()
+        data['cpu'] = self.get_cpu_info()
+        data['mem'] = self.get_mem_info()
+        data['disk'] = self.get_disk_info()
+        data['eth'] = self.get_eth_info()
+        data['virt_type'] = self.get_virtual_type()
+        data['vm_info'] = self.get_vm_info()
+        data['stor'] = self.get_stor_info()
+        return data

@@ -70,7 +70,21 @@ class APIRouter(nova.api.openstack.APIRouter):
             mapper.resource("server", "servers",
                             controller=self.resources['servers'],
                             collection={'detail': 'GET'},
-                            member={'action': 'POST'})
+                            member={'action': 'POST',
+                                    'check_disable_compute_node': 'POST',
+                                    'check_enable_compute_node': 'POST',
+                                    'add_compute_node': 'POST',
+                                    'change_admin_password': 'POST',
+                                    'update_metadata': 'POST',
+                                    'backup2_instance': 'POST',
+                                    'backup2_resume_instance': 'POST',
+                                    'backup2_list': 'GET',
+                                    'backup2_show': 'GET',
+                                    'backup2_delete': 'POST',
+                                    'backup2_to_image': 'POST',
+                                    'backup2_rename': 'POST',
+                                    'compute_node_info': 'GET',
+                                    })
 
         if init_only is None or 'ips' in init_only:
             self.resources['ips'] = ips.create_resource()
@@ -82,7 +96,8 @@ class APIRouter(nova.api.openstack.APIRouter):
             self.resources['images'] = images.create_resource()
             mapper.resource("image", "images",
                             controller=self.resources['images'],
-                            collection={'detail': 'GET'})
+                            collection={'detail': 'GET'},
+                            member={'image_capacity': 'GET'})
 
         if init_only is None or 'limits' in init_only:
             self.resources['limits'] = limits.create_resource()

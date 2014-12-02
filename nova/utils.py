@@ -1188,3 +1188,30 @@ else:
         for x, y in zip(first, second):
             result |= ord(x) ^ ord(y)
         return result == 0
+
+def get_hostname(ipaddr):
+    try:
+        hostname = socket.gethostbyaddr(ipaddr)[0]
+        return hostname
+    except:
+        return None
+
+def diff_dict(orig, new):
+    """
+    Return a dict describing how to change orig to new.  The keys
+    correspond to values that have changed; the value will be a list
+    of one or two elements.  The first element of the list will be
+    either '+' or '-', indicating whether the key was updated or
+    deleted; if the key was updated, the list will contain a second
+    element, giving the updated value.
+    """
+    # Figure out what keys went away
+    result = dict((k, ['-']) for k in set(orig.keys()) - set(new.keys()))
+    # Compute the updates
+    for key, value in new.items():
+        if key not in orig or value != orig[key]:
+            result[key] = ['+', value]
+    return result
+
+def flush_page_cache():
+    execute("echo", "3", ">", "/proc/sys/vm/drop_caches", run_as_root=True)

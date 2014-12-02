@@ -279,6 +279,11 @@ class LocalAPI(object):
     def object_backport(self, context, objinst, target_version):
         return self._manager.object_backport(context, objinst, target_version)
 
+    def backup2_status_update(self, context, instance, backup_id, values):
+        host = instance['host']
+        return self._manager.backup2_status_update(context, host, backup_id,
+                                                  values)
+
 
 class LocalComputeTaskAPI(object):
     def __init__(self):
@@ -319,6 +324,24 @@ class LocalComputeTaskAPI(object):
     def unshelve_instance(self, context, instance):
         utils.spawn_n(self._manager.unshelve_instance, context,
                 instance=instance)
+
+    def rebuild_instance(self, context, instance, orig_image_ref, image_ref,
+                         injected_files, new_pass, orig_sys_metadata,
+                         bdms, recreate=False, on_shared_storage=False,
+                         preserve_ephemeral=False, host=None, kwargs=None):
+        # kwargs unused but required for cell compatibility.
+        utils.spawn_n(self._manager.rebuild_instance, context,
+                instance=instance,
+                new_pass=new_pass,
+                injected_files=injected_files,
+                image_ref=image_ref,
+                orig_image_ref=orig_image_ref,
+                orig_sys_metadata=orig_sys_metadata,
+                bdms=bdms,
+                recreate=recreate,
+                on_shared_storage=on_shared_storage,
+                host=host,
+                preserve_ephemeral=preserve_ephemeral)
 
 
 class API(LocalAPI):
@@ -401,3 +424,21 @@ class ComputeTaskAPI(object):
     def unshelve_instance(self, context, instance):
         self.conductor_compute_rpcapi.unshelve_instance(context,
                 instance=instance)
+
+    def rebuild_instance(self, context, instance, orig_image_ref, image_ref,
+                         injected_files, new_pass, orig_sys_metadata,
+                         bdms, recreate=False, on_shared_storage=False,
+                         preserve_ephemeral=False, host=None, kwargs=None):
+        # kwargs unused but required for cell compatibility
+        self.conductor_compute_rpcapi.rebuild_instance(context,
+                instance=instance,
+                new_pass=new_pass,
+                injected_files=injected_files,
+                image_ref=image_ref,
+                orig_image_ref=orig_image_ref,
+                orig_sys_metadata=orig_sys_metadata,
+                bdms=bdms,
+                recreate=recreate,
+                on_shared_storage=on_shared_storage,
+                preserve_ephemeral=preserve_ephemeral,
+                host=host)

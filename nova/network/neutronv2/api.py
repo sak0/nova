@@ -1136,6 +1136,7 @@ class API(base.Base):
         client = neutronv2.get_client(context, admin=True)
         data = client.list_ports(**search_opts)
 
+
         current_neutron_ports = data.get('ports', [])
         networks, port_ids = self._gather_port_ids_and_networks(
                 context, instance, networks, port_ids)
@@ -1175,7 +1176,9 @@ class API(base.Base):
                     details=current_neutron_port.get('binding:vif_details'),
                     ovs_interfaceid=ovs_interfaceid,
                     devname=devname,
-                    active=vif_active))
+                    active=vif_active,
+                    bandwidth_rx = current_neutron_port.get('bandwidth_rx'),
+                    bandwidth_tx = current_neutron_port.get('bandwidth_tx')))
 
         return nw_info
 

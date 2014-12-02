@@ -46,6 +46,7 @@ from nova import quota
 from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova.scheduler import utils as scheduler_utils
 
+
 LOG = logging.getLogger(__name__)
 
 # Instead of having a huge list of arguments to instance_update(), we just
@@ -90,6 +91,7 @@ class ConductorManager(manager.Manager):
         self.cells_rpcapi = cells_rpcapi.CellsAPI()
         self.additional_endpoints.append(self.compute_task_mgr)
         self.additional_endpoints.append(_ConductorManagerV2Proxy(self))
+
 
     @property
     def network_api(self):
@@ -640,6 +642,9 @@ class ConductorManager(manager.Manager):
     def object_backport(self, context, objinst, target_version):
         return objinst.obj_to_primitive(target_version=target_version)
 
+    def backup2_status_update(self, context, backup_id, values, host):
+        self.db.backup2_update(context, backup_id, values)
+
 
 class ComputeTaskManager(base.Base):
     """Namespace for compute methods.
@@ -872,6 +877,46 @@ class ComputeTaskManager(base.Base):
                 del(sys_meta[key])
         instance.system_metadata = sys_meta
         instance.save()
+        
+    def rebuild_instance(self, context, instance, orig_image_ref, image_ref,
+                         injected_files, new_pass, orig_sys_metadata,
+                         bdms, recreate, on_shared_storage,
+                         preserve_ephemeral=False, host=None):
+
+        with compute_utils.EventReporter(context, 'rebuild_server',
+                                          instance.uuid):
+            if not host:
+                # NOTE(lcostantino): Retrieve scheduler filters for the
+                # instance when the feature is available
+                filter_properties = {'ignore_hosts': [instance.host]}
+                request_spec = scheduler_utils.build_request_spec(context,
+                                                                  image_ref,
+                                                                  [instance])
+                try:
+                    hosts = self.scheduler_rpcapi.select_destinations(context, request_spec, filter_properties)
+                    host = hosts.pop(0)['host']
+                    LOG.info(("scheduler select_destinations: %{host}"), {'host': host})
+                except exception.NoValidHost as ex:
+                    with excutils.save_and_reraise_exception():
+                        self._set_vm_state_and_notify(context,
+                                'rebuild_server',
+                                {'vm_state': instance.vm_state,
+                                 'task_state': None}, ex, request_spec)
+                        LOG.warning(_("No valid host found for rebuild"),
+                                      instance=instance)
+
+            self.compute_rpcapi.rebuild_instance(context,
+                    instance=instance,
+                    new_pass=new_pass,
+                    injected_files=injected_files,
+                    image_ref=image_ref,
+                    orig_image_ref=orig_image_ref,
+                    orig_sys_metadata=orig_sys_metadata,
+                    bdms=bdms,
+                    recreate=recreate,
+                    on_shared_storage=on_shared_storage,
+                    preserve_ephemeral=preserve_ephemeral,
+                    host=host)
 
 
 class _ConductorManagerV2Proxy(object):

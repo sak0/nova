@@ -112,3 +112,8 @@ SHELVING_OFFLOADING = 'shelving_offloading'
 
 # possible task states during unshelve()
 UNSHELVING = 'unshelving'
+
+UPDATING_PASSWORD = 'updating_password'
+RESTORE_TO_HOST = 'restore_to_host'
+BACKUP_DISK = 'backuping'
+BACKUP_RESUME = 'backup_resume'

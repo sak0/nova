@@ -260,7 +260,7 @@ class VIF(Model):
     """Represents a Virtual Interface in Nova."""
     def __init__(self, id=None, address=None, network=None, type=None,
                  details=None, devname=None, ovs_interfaceid=None,
-                 qbh_params=None, qbg_params=None, active=False,
+                 qbh_params=None, qbg_params=None, active=False,bandwidth_rx=-1,bandwidth_tx=-1,
                  **kwargs):
         super(VIF, self).__init__()
 
@@ -275,13 +275,15 @@ class VIF(Model):
         self['qbh_params'] = qbh_params
         self['qbg_params'] = qbg_params
         self['active'] = active
+        self['bandwidth_rx'] = bandwidth_rx
+        self['bandwidth_tx'] = bandwidth_tx
 
         self._set_meta(kwargs)
 
     def __eq__(self, other):
         keys = ['id', 'address', 'network', 'type', 'details', 'devname',
                 'ovs_interfaceid', 'qbh_params', 'qbg_params',
-                'active']
+                'active', 'bandwidth_rx', 'bandwidth_tx']
         return all(self[k] == other[k] for k in keys)
 
     def __ne__(self, other):

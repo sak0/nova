@@ -24,6 +24,12 @@ import functools
 import re
 import string
 import uuid
+import json
+import time
+import socket
+import os
+import statvfs
+import subprocess
 
 from oslo.config import cfg
 import six
@@ -68,12 +74,14 @@ from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
+from nova.openstack.common import jsonutils
 import nova.policy
 from nova import quota
 from nova import rpc
 from nova import servicegroup
 from nova import utils
 from nova import volume
+from nova import db
 
 LOG = logging.getLogger(__name__)
 
@@ -86,6 +94,10 @@ compute_opts = [
                 default=False,
                 help='Allow destination machine to match source for resize. '
                      'Useful when testing in single-host environments.'),
+    cfg.BoolOpt('allow_quick_resize',
+                default=False,
+                help='Allow use quick-resize func. '
+                     'Useful when quick-resize/hotplug in single-host environments.'),
     cfg.BoolOpt('allow_migrate_to_same_host',
                 default=False,
                 help='Allow migrate machine to the same host. '
@@ -117,6 +129,12 @@ compute_opts = [
                      'in a local image being created on the hypervisor node. '
                      'Setting this to 0 means nova will allow only '
                      'boot from volume. A negative number means unlimited.'),
+     cfg.IntOpt('image_filesystem_store_datadir',
+                default='/var/lib/glance/images',
+                help='filesystem_store_datadir'),
+     cfg.IntOpt('image_default_store',
+                default='file',
+                help='glance image default store backend'),
 ]
 
 
@@ -125,6 +143,9 @@ CONF.register_opts(compute_opts)
 CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
 CONF.import_opt('enable', 'nova.cells.opts', group='cells')
 CONF.import_opt('default_ephemeral_format', 'nova.virt.driver')
+CONF.import_opt('cpu_allocation_ratio', 'nova.scheduler.filters.core_filter')
+CONF.import_opt('disk_allocation_ratio', 'nova.scheduler.filters.disk_filter')
+CONF.import_opt('ram_allocation_ratio', 'nova.scheduler.filters.ram_filter')
 
 MAX_USERDATA_SIZE = 65535
 QUOTAS = quota.QUOTAS
@@ -726,6 +747,7 @@ class API(base.Base):
                 base64.decodestring(user_data)
             except base64.binascii.Error:
                 raise exception.InstanceUserDataMalformed()
+            
 
         self._checks_for_create_and_rebuild(context, image_id, boot_meta,
                 instance_type, metadata, injected_files)
@@ -957,6 +979,7 @@ class API(base.Base):
         availability_zone, forced_host, forced_node = handle_az(context,
                                                             availability_zone)
 
+
         base_options, max_net_count = self._validate_and_build_base_options(
                 context,
                 instance_type, boot_meta, image_href, image_id, kernel_id,
@@ -966,6 +989,9 @@ class API(base.Base):
                 access_ip_v6, requested_networks, config_drive,
                 block_device_mapping, auto_disk_config, reservation_id,
                 max_count)
+        LOG.info("#"*80)
+        LOG.info(base_options)
+        LOG.info("#"*80)
 
         # max_net_count is the maximum number of instances requested by the
         # user adjusted for any network quota constraints, including
@@ -987,8 +1013,10 @@ class API(base.Base):
                 min_count, max_count, base_options, boot_meta, security_groups,
                 block_device_mapping)
 
+
         filter_properties = self._build_filter_properties(context,
                 scheduler_hints, forced_host, forced_node, instance_type)
+
 
         self._update_instance_group(context, instances, scheduler_hints)
 
@@ -2413,6 +2441,15 @@ class API(base.Base):
 
         if same_instance_type and flavor_id and self.cell_type != 'compute':
             raise exception.CannotResizeToSameFlavor()
+        
+        ## hot resize judge: 
+        ## virtual_type == QEMU && local resource able to resize
+        ideltas = self._resize_delta(context, new_instance_type,
+                                       current_instance_type, 1, 1)
+        local_resize = self.resize_check_overflow(context, instance, ideltas)
+        same_root = new_instance_type['root_gb'] == current_instance_type['root_gb']
+        ## hot resize judge
+
 
         # ensure there is sufficient headroom for upsizes
         deltas = self._upsize_quota_delta(context, new_instance_type,
@@ -2462,7 +2499,14 @@ class API(base.Base):
         self._record_action_start(context, instance, instance_actions.RESIZE)
 
         scheduler_hint = {'filter_properties': filter_properties}
-        self.compute_task_api.resize_instance(context, instance,
+        
+        if CONF.allow_quick_resize and local_resize and same_root:
+            LOG.info("quick resize in nova.compute.api:resize")
+            self.compute_rpcapi.quick_resize_instance(context, instance,
+                                                        instance_type=new_instance_type,
+                                                        reservations=quotas.reservations)
+        else:
+            self.compute_task_api.resize_instance(context, instance,
                 extra_instance_updates, scheduler_hint=scheduler_hint,
                 flavor=new_instance_type,
                 reservations=quotas.reservations or [])
@@ -3059,7 +3103,7 @@ class API(base.Base):
             context, instance_obj.Instance(), instance,
             expected_attrs=['metadata', 'system_metadata', 'info_cache'])
 
-        return self.compute_rpcapi.rebuild_instance(context,
+        return self.compute_task_api.rebuild_instance(context,
                                         instance=inst_obj,
                                         new_pass=admin_password,
                                         injected_files=None,
@@ -3123,6 +3167,385 @@ class API(base.Base):
             # will not prevent processing events on other hosts
             self.compute_rpcapi.external_instance_event(
                 context, instances_by_host[host], events_by_host[host])
+
+    def check_disable_compute_node(self, ctxt, host,check_status=False):
+        service = 'nova-compute'
+        from nova import db
+        if check_status:
+            LOG.info("check_status::::")
+            host_instances =db.instance_get_all_by_host(ctxt, host)
+            if host_instances:
+                 raise exception.ComputeNodeInstanceExists(host = host)
+        svc = db.service_get_by_args(ctxt, host, service)
+        if not svc:
+            raise exception.ComputeServiceUnavailable(host = host)
+        elif svc['disabled']:
+            raise exception.ComputeServiceIsDisable(host = host)
+        db.service_update(ctxt, svc['id'], {'disabled': True})
+        
+    def _check_enable_compute_node(self, ctxt, host):
+        service = 'nova-compute'
+        from nova import db
+        svc = db.service_get_by_args(ctxt, host, service)
+        if not svc:
+            raise exception.ComputeServiceUnavailable(host = host)
+        elif not svc['disabled']:
+            raise exception.ComputeServiceIsEnable(host = host)
+        results = self.compute_rpcapi.check_enable_compute_node(ctxt, host=host)
+        if results:
+                raise exception.ComputeNodeInstanceExists(host = host)
+        db.service_update(ctxt, svc['id'], {'disabled': False})
+        
+    @wrap_check_policy
+    def check_enable_compute_node(self, ctxt, host):
+        return self._check_enable_compute_node(ctxt, host)
+
+
+    def get_host_info(self, context, host):
+        """"""
+        # NOTE(comstud): No instance_uuid argument to this compute manager
+        # call
+        
+        try:
+            hostinfo =  self.compute_rpcapi.get_host_info(context, host=host)
+        except Exception:
+            raise
+        metadata = db.aggregate_metadata_get_by_host(
+                     context, host, key='cpu_allocation_ratio')
+        aggregate_vals = metadata.get('cpu_allocation_ratio', set())
+        num_values = len(aggregate_vals)
+        if num_values == 0:
+            ratio = CONF.cpu_allocation_ratio
+        if num_values > 1:
+            LOG.warning(_("%(num_values)d ratio values found, "
+                          "of which the minimum value will be used."),
+                         {'num_values': num_values})
+            try:
+                ratio = float(min(aggregate_vals))
+            except ValueError as e:
+                LOG.warning(_("Could not decode cpu_allocation_ratio: '%s'"), e)
+                ratio = CONF.cpu_allocation_ratio
+        hostinfo['cpu_allocation_ratio'] = jsonutils.dumps(ratio)
+        hostinfo['disk_allocation_ratio'] = jsonutils.dumps(CONF.disk_allocation_ratio)
+        hostinfo['ram_allocation_ratio'] = jsonutils.dumps(CONF.ram_allocation_ratio)
+        
+        res = db.compute_node_search_by_hypervisor(context, host)
+        memory_mb_used = res[0].get('memory_mb_used', 0)
+        local_gb_used = res[0].get('local_gb_used', 0)
+        hostinfo['mem']['allocated'] = jsonutils.dumps(memory_mb_used)
+        hostinfo['disk']['allocated'] = jsonutils.dumps(local_gb_used)
+        
+        return hostinfo
+
+    @check_instance_lock
+    @check_instance_state(vm_state=[vm_states.STOPPED], task_state=None)
+    def change_admin_password(self, context, instance, admin_pass):
+        self.update(context,
+                    instance,
+                    task_state=task_states.UPDATING_PASSWORD,
+                    expected_task_state=None)
+        self.compute_rpcapi.change_admin_password(context, instance=instance,
+                                            admin_pass=admin_pass)
+
+    @wrap_check_policy
+    @check_instance_lock
+    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED, vm_states.STOPPED],
+                          task_state=None)
+    def update_metadata(self, context, instance,
+                                 metadata, delete=False):
+        """Updates or creates instance metadata.
+
+        If delete is True, metadata items that are not specified in the
+        `metadata` argument will be deleted.
+
+        """
+
+        orig = self.get_instance_metadata(context, instance)
+        if delete:
+            _metadata = metadata
+        else:
+            _metadata = orig.copy()
+            _metadata.update(metadata)
+
+        self._check_metadata_properties_quota(context, _metadata)
+        metadata = self.db.instance_metadata_update(context, instance['uuid'],
+                                         _metadata, True)
+        instance['metadata'] = metadata
+        notifications.send_update(context, instance, instance)
+        diff = utils.diff_dict(orig, _metadata)
+        LOG.info(instance)
+        if instance['vm_state'] == vm_states.ACTIVE:
+            self.compute_rpcapi.update_metadata(context,
+                                                    instance=instance,
+                                                     metadata=metadata)
+        return _metadata
+
+    @wrap_check_policy
+    @check_instance_state(vm_state=[vm_states.ACTIVE],
+                          task_state=[None])
+    def backup2_instance(self, context, instance, name, description):
+        return self._backup2_instance(context, instance, name, description)
+
+    def _backup2_instance(self, context, instance, name, description):
+        instance_uuid = instance['uuid']
+        backup_time = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        backup_id = str(uuid.uuid4())
+        properties = {
+            'id': backup_id,
+            'instance_uuid': instance_uuid,
+            'image_ref': instance['image_ref'],
+            'backup_time': backup_time,
+            'backup_status': "",
+            'display_name': name,
+            'display_description': description
+        }
+        bak_info = json.dumps(properties)
+        self._record_action_start(context, instance, instance_actions.BACKUPING)
+        self.db.backup2_create(context, properties)
+        self.compute_rpcapi.backup2_instance_easy(context,
+                                                  instance=instance,
+                                                  bak_info=bak_info)
+        rsp = json.dumps({'id' : backup_id})
+        return rsp
+
+    @wrap_check_policy
+    def backup2_rename(self, context, backup, name):
+        return self._backup2_rename(context, backup, name)
+
+    def _backup2_rename(self, context, backup, name,):
+        properties = {
+            'display_name': name,
+        }
+        self.db.backup2_update(context, backup, properties)
+
+    @wrap_check_policy
+    @check_instance_lock
+    @check_instance_host
+    @check_instance_cell
+    @check_instance_state(vm_state=[vm_states.ACTIVE],
+                          task_state=[None])
+    def backup2_resume_instance(self, context, instance, backup_id):
+        """Resume an instance."""
+        LOG.debug(_("Going to try to resume instance"), instance=instance)
+
+
+        #self._record_action_start(context, instance, instance_actions.RESUMING)
+        # TODO(yamahata): injected_files isn't supported right now.
+        #                 It is used only for osapi. not for ec2 api.
+        #                 availability_zone isn't used by run_instance.
+        res = self.db.backup2_get(context, backup_id)
+        if res['backup_status'] != 'active':
+            raise exception.Invalid
+        self.compute_rpcapi.backup2_resume_instance(context, instance=instance,
+                                                   bak_info=res)
+
+    @wrap_check_policy
+    def backup2_show(self, context, backup_id):
+        return self._backup2_show(context, backup_id)
+
+    def _backup2_show(self, context, backup_id):
+        context.read_deleted = "yes"
+        res = self.db.backup2_get(context, backup_id)
+        rsp = {}
+        item = {}
+        item['id'] = res.get('id')
+        item['name'] = res.get('display_name')
+        #item['description'] = res.get('display_description', None)
+        item['instance_uuid'] = res.get('instance_uuid')
+        item['backup_time'] = res.get('backup_time')
+        item['backup_path'] = res.get('backup_path')
+        item['backup_status'] = res.get('backup_status')
+        item['backup_size'] = res.get('backup_size')
+        item['created_at'] = str(res.get('created_at'))
+        rsp['backup_info'] = item
+        rsp2json = json.dumps(rsp)
+        return rsp2json        
+
+    @wrap_check_policy
+    def backup2_list(self, context, instance):
+        return self._backup2_list(context, instance)
+
+    def _backup2_list(self, context, instance):
+        uuid = instance['uuid']
+        context.read_deleted = "yes"
+        res = self.db.backup2_get_by_instance_uuid(context, uuid)
+        rsp = {}
+        li = []
+        for i in range(len(res)):
+            item = {}
+            item['id'] = res[i].get('id')
+            item['name'] = res[i].get('display_name')
+            item['description'] = res[i].get('display_description', None)
+            item['instance_uuid'] = res[i].get('instance_uuid')
+            item['backup_time'] = res[i].get('backup_time')
+            item['backup_path'] = res[i].get('backup_path')
+            item['backup_status'] = res[i].get('backup_status')
+            item['backup_size'] = res[i].get('backup_size')
+            item['created_at'] = str(res[i].get('created_at'))
+            li.append(item)
+        rsp['backup_list'] = li
+            
+        rsp2json = json.dumps(rsp)
+        return rsp2json
+
+    @wrap_check_policy
+    def backup2_delete(self, context, backup_id):
+        res = self.db.backup2_get(context, backup_id)
+        if res['backup_status'] == 'upload':
+            raise exception.Invalid
+        instance_id = res.get('instance_uuid', None)
+        context.read_deleted = "yes"
+        if instance_id:
+            instance = self.get(context, instance_id)
+            self.compute_rpcapi.backup2_delete(context, instance=instance,
+                                               bak_info=res)
+            self.db.backup2_destroy(context, backup_id)
+
+    def backup2_to_image(self, context, req, backup_id, name,
+                         extra_properties=None):
+        """convert backup to image.
+
+        :param instance: nova.db.sqlalchemy.models.Instance
+        :param name: name of the snapshot
+        :param extra_properties: dict of extra image properties to include
+                                 when creating the image.
+        :returns: A dict containing image metadata
+        """
+        info = self.db.backup2_get(context, backup_id)
+        context.read_deleted = "yes"
+        if info['backup_status'] != 'active':
+            raise exception.Invalid
+        instance_id = info.get('instance_uuid', None)
+
+        if instance_id:
+            instance = self.get(context, instance_id, want_objects=True)
+
+            image_meta = self._create_image(context, instance, name,
+                                            'snapshot',
+                                            extra_properties=extra_properties)
+            self.compute_rpcapi.backup2_to_image(context, instance, info,
+                                                 image_meta['id'])
+            return image_meta
+
+    @staticmethod
+    def _resize_delta(context, new_instance_type,
+                            old_instance_type, sense, compare):
+        """
+        Calculate any quota adjustment required at a particular point
+        in the resize cycle.
+
+        :param context: the request context
+        :param new_instance_type: the target instance type
+        :param old_instance_type: the original instance type
+        :param sense: the sense of the adjustment, 1 indicates a
+                      forward adjustment, whereas -1 indicates a
+                      reversal of a prior adjustment
+        :param compare: the direction of the comparison, 1 indicates
+                        we're checking for positive deltas, whereas
+                        -1 indicates negative deltas
+        """
+        def _quota_delta(resource):
+            return sense * (new_instance_type[resource] -
+                            old_instance_type[resource])
+
+        deltas = { 'vcpus' : 0,
+                  'memory_mb' : 0,
+                  'local_gb' : 0
+                  }
+        if compare * _quota_delta('vcpus') > 0:
+            deltas['vcpus'] = _quota_delta('vcpus')
+        if compare * _quota_delta('memory_mb') > 0:
+            deltas['memory_mb'] = _quota_delta('memory_mb')
+        if compare * _quota_delta('root_gb') > 0:
+            deltas['local_gb'] = _quota_delta('root_gb')
+
+        return deltas
+
+
+    def get_host_resource(self, context, instance, host=None):
+        if not host:
+            host=instance["host"]
+        service_ref = self.db.service_get_by_compute_host(context, host)
+        instance_refs = self.db.instance_get_all_by_host(context,
+                                                         service_ref['host'])
+        # Getting total available/used resource
+        compute_ref = service_ref['compute_node'][0]
+        resources = {'vcpus': compute_ref['vcpus'],
+                    'memory_mb': compute_ref['memory_mb'],
+                    'local_gb': compute_ref['local_gb'],
+                    'vcpus_used': compute_ref['vcpus_used'],
+                    'memory_mb_used': compute_ref['memory_mb_used'],
+                    'local_gb_used': compute_ref['local_gb_used'],
+                    'hypervisor_type' : compute_ref['hypervisor_type']}
+        return resources
+    
+    def check_resource_overflow(self, avai, need):
+        #check_list = ['memory_mb', 'local_gb']
+        check_list = ['memory_mb']
+        over = [item for item in avai if avai[item] <= need[item] and item in check_list]
+        if over:
+            LOG.warn("the host's resources is overflow for resize, goto old resize-func.")
+            return False
+        return True
+    
+    def resize_check_overflow(self, context, instance, need):
+        resources = self.get_host_resource(context, instance)
+        
+        if resources['hypervisor_type'] != "QEMU":
+            LOG.warn("the host's hypervisor_type is not QEMU, goto old resize-func.")
+            return False
+        free_ram_mb = resources['memory_mb'] - resources['memory_mb_used']
+        free_disk_gb = resources['local_gb'] - resources['local_gb_used']
+        free_vcpus = resources['vcpus'] - resources['vcpus_used']
+        
+        avai = {'memory_mb': free_ram_mb,
+                'local_gb': free_disk_gb,
+                'vcpus': free_vcpus}
+        
+        return self.check_resource_overflow(avai, need)
+    
+    def image_capacity_block(self):
+        raise NotImplementedError()
+
+
+    def image_capacity_fs(self, path):
+        stor_info = {}
+        vfs = os.statvfs(path)
+        stor_info['available'] = vfs[statvfs.F_BAVAIL]*vfs[statvfs.F_BSIZE]/(1024*1024*1024)
+        stor_info['total']=vfs[statvfs.F_BLOCKS]*vfs[statvfs.F_BSIZE]/(1024*1024*1024)
+        stor_info['used'] = stor_info['total'] - stor_info['available']
+        #if CONF.gluster_vol and CONF.gluster_ip:
+        #    stor_info['stor_type'] = 'GLUSTERFS'
+        #    stor_info['stor_identifier'] = CONF.gluster_ip + ':/' + CONF.gluster_vol
+        #    return stor_info
+        cmd = "mount |grep " + path + " | awk '{print $1}'"
+        p = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE)
+        line = p.stdout.readline()
+        device_str = re.sub('\n', '', line)
+        if device_str:
+            stor_info['stor_type'] = 'GLUSTERFS'
+            stor_info['stor_identifier'] = device_str
+        else:
+            stor_info['stor_type'] = 'FILESYSTEM'
+            stor_info['stor_identifier'] = None
+        return stor_info          
+    
+    
+    def image_capacity(self):
+        stor_info = {}
+        if CONF.image_default_store == 'file':
+            try:
+                return self.image_capacity_fs(CONF.image_filesystem_store_datadir)
+            except Exception, e:
+                LOG.error(e)
+                raise
+        else:
+            try:
+                return self.image_capacity_block()
+            except Exception:
+                raise 
+
+
 
 
 class HostAPI(base.Base):

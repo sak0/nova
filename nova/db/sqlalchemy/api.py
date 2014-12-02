@@ -43,8 +43,10 @@ from sqlalchemy.schema import Table
 from sqlalchemy.sql.expression import asc
 from sqlalchemy.sql.expression import desc
 from sqlalchemy.sql.expression import select
+from sqlalchemy.sql.expression import literal_column
 from sqlalchemy.sql import func
 from sqlalchemy import String
+
 
 from nova import block_device
 from nova.compute import task_states
@@ -55,6 +57,7 @@ from nova import exception
 from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common.db.sqlalchemy import session as db_session
 from nova.openstack.common.db.sqlalchemy import utils as sqlalchemyutils
+
 from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
@@ -6067,3 +6070,63 @@ def pci_device_update(context, node_id, address, values):
         device.update(values)
         session.add(device)
     return device
+
+
+@require_context
+def backup2_create(context, values):
+    backup_ref = models.Backup2()
+    backup_ref.update(values)
+
+    if not values.get('id'):
+        values['id'] = str(utils.gen_uuid())
+
+    session = get_session()
+    with session.begin():
+        backup_ref.save(session=session)
+    return backup_ref
+
+
+@require_admin_context
+def backup2_destroy(context, backup_id):
+    session = get_session()
+    with session.begin():
+        session.query(models.Backup2).\
+                filter_by(id=backup_id).\
+                update({'deleted': True,
+                        'backup_status': 'deleted',
+                        'deleted_at': timeutils.utcnow(),
+                        'updated_at': literal_column('updated_at')})
+
+
+@require_context
+def backup2_get(context, backup_id, session=None):
+    result = model_query(context, models.Backup2, session=session,
+                         project_only=True).\
+                filter_by(id=backup_id).\
+                first()
+
+    if not result:
+        raise exception.BackupNotFound(backup_id=backup_id)
+
+    return result
+
+@require_context
+def backup2_get_by_instance_uuid(context, uuid, session=None):
+    result = model_query(context, models.Backup2, session=session,
+                         project_only=True).\
+                filter_by(instance_uuid=uuid).\
+                all()
+    return result
+
+@require_admin_context
+def backup2_get_all(context):
+    return model_query(context, models.Backup2).all()
+
+
+@require_context
+def backup2_update(context, backup_id, values):
+    session = get_session()
+    with session.begin():
+        snapshot_ref = backup2_get(context, backup_id, session=session)
+        snapshot_ref.update(values)
+        snapshot_ref.save(session=session)

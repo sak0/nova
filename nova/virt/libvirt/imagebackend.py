@@ -304,11 +304,6 @@ class Image(object):
             raise exception.DiskInfoReadWriteFail(reason=unicode(e))
         return driver_format
 
-    @staticmethod
-    def is_shared_block_storage():
-        """True if the backend puts images on a shared block storage."""
-        return False
-
 
 class Raw(Image):
     def __init__(self, instance=None, disk_name=None, path=None):
@@ -687,10 +682,6 @@ class Rbd(Image):
 
     def snapshot_extract(self, target, out_format):
         images.convert_image(self.path, target, out_format)
-
-    @staticmethod
-    def is_shared_block_storage():
-        return True
 
 
 class Backend(object):

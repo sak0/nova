@@ -258,6 +258,12 @@ libvirt_opts = [
                 help='A path to a device that will be used as source of '
                      'entropy on the host. Permitted options are: '
                      '/dev/random or /dev/hwrng'),
+    cfg.StrOpt('backup_path',
+                default="/var/lib/nova/instances/backup",
+                help='where backup are stored on disk (string value)'),
+    cfg.StrOpt('max_vcpus',
+                default=32,
+                help='max_vcpus number'),
     ]
 
 CONF = cfg.CONF
@@ -4199,22 +4205,6 @@ class LibvirtDriver(driver.ComputeDriver):
         return stats
 
     def check_instance_shared_storage_local(self, context, instance):
-        """Check if instance files located on shared storage.
-
-        This runs check on the destination host, and then calls
-        back to the source host to check the results.
-
-        :param context: security context
-        :param instance: nova.db.sqlalchemy.models.Instance
-        :returns
-            :tempfile: A dict containing the tempfile info on the destination
-                       host
-            :None: 1. If the instance path is not existing.
-                   2. If the image backend is shared block storage type.
-        """
-        if self.image_backend.backend().is_shared_block_storage():
-            return None
-
         dirpath = libvirt_utils.get_instance_path(instance)
 
         if not os.path.exists(dirpath):
@@ -5205,13 +5195,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # ensure directories exist and are writable
         instance_path = libvirt_utils.get_instance_path(instance)
         LOG.debug(_('Checking instance files accessibility %s'), instance_path)
-        shared_instance_path = os.access(instance_path, os.W_OK)
-        # NOTE(flwang): For shared block storage scenario, the file system is
-        # not really shared by the two hosts, but the volume of evacuated
-        # instance is reachable.
-        shared_block_storage = (self.image_backend.backend().
-                                is_shared_block_storage())
-        return shared_instance_path or shared_block_storage
+        return os.access(instance_path, os.W_OK)
 
     def inject_network_info(self, instance, nw_info):
         self.firewall_driver.setup_basic_filtering(instance, nw_info)
@@ -5276,6 +5260,275 @@ class LibvirtDriver(driver.ComputeDriver):
                                        instance, root_device_name,
                                        ephemerals, swap,
                                        block_device_mapping)
+
+    def check_enable_compute_node(self, context, host):
+        """Efficient override of base instance_exists method."""
+        results = self._conn.listDefinedDomains()
+        if results:
+                return results
+        instance_num = self._conn.numOfDomains()
+        return instance_num
+
+    def get_host_info(self):
+        """Returns the result of calling "uptime"."""
+        #NOTE(dprince): host seems to be ignored for this call and in
+        # other compute drivers as well. Perhaps we should remove it?
+        phy_host = libvirt_utils.phyhost()
+        return phy_host.info()
+
+    def change_admin_password_win(self, instance, admin_pass, files, partition):
+        try:
+            virt_dom = self._lookup_by_name(instance['name'])
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning()
+   
+        # Find the disk
+        xml_desc = virt_dom.XMLDesc(0)
+        domain = etree.fromstring(xml_desc)
+        source = domain.find('devices/disk/source')
+        disk_path = source.get('file')
+        injection_path = disk_path
+        key = net = metadata = admin_pass = None
+        target_partition = partition
+        try:
+            disk.inject_data(injection_path,
+                             key, net, metadata, admin_pass, files,
+                             partition=target_partition,
+                             use_cow=CONF.use_cow_images)
+        except Exception as e:
+            # This could be a windows image, or a vmdk format disk
+            LOG.warn(_('Ignoring error injecting password into instance '), instance=instance)
+            LOG.error(e.message)
+
+
+    def change_admin_password(self, instance, admin_pass):
+        try:
+            virt_dom = self._lookup_by_name(instance['name'])
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning()
+   
+        # Find the disk
+        xml_desc = virt_dom.XMLDesc(0)
+        domain = etree.fromstring(xml_desc)
+        source = domain.find('devices/disk/source')
+        disk_path = source.get('file')
+        injection_path = disk_path
+        key = net = metadata = files = None
+        target_partition = CONF.libvirt.inject_partition
+        try:
+            disk.inject_data(injection_path,
+                             key, net, metadata, admin_pass, files,
+                             partition=target_partition,
+                             use_cow=CONF.use_cow_images)
+        except Exception as e:
+            # This could be a windows image, or a vmdk format disk
+            LOG.warn(_('Ignoring error injecting password into instance '), instance=instance)
+            LOG.error(e.message)
+
+    def blkdeviotune(self, uuid, device, value):
+        out, err = utils.execute('virsh',
+                                 'blkdeviotune',
+                                 '%s' % uuid,
+                                 '%s' % device,
+                                 '--total_iops_sec',
+                                 '%s' % value,
+                                 run_as_root=True,
+                                 check_exit_code=True)
+    
+    def update_instance_quota(self, instance, key, value):
+        try:
+            virt_dom = self._lookup_by_name(instance['name'])
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning()
+        
+        if key == 'quota:disk_total_iops_sec':
+            self.blkdeviotune(instance["uuid"], 'vda', value)
+
+    def update_metadata(self, context, instance, metadata):
+        LOG.info(_("Starting update_metadata"), instance=instance)
+
+        tune_items = ['disk_read_bytes_sec', 'disk_read_iops_sec',
+            'disk_write_bytes_sec', 'disk_write_iops_sec',
+            'disk_total_bytes_sec', 'disk_total_iops_sec']
+        
+        for key, value in metadata.iteritems():
+            scope = key.split(':')
+            if len(scope) > 1 and scope[0] == 'quota':
+                if scope[1] in tune_items:
+                    self.update_instance_quota(instance, key, value)
+
+    def _wait_for_dom_block_job(self, uuid):
+        out, err = utils.trycmd('virsh', 'qemu-monitor-command', uuid, '--hmp', 'info', 'block-jobs',
+                                run_as_root=True)
+        if out.find('No active') >= 0:
+            return False
+        return True
+
+
+    def backup2_instance(self, instance, bak_info):    
+        try:
+            virt_dom = self._lookup_by_name(instance['name'])
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning()
+    
+        # Find the disk
+        xml_desc = virt_dom.XMLDesc(0)
+        domain = etree.fromstring(xml_desc)
+        
+        disk_path = libvirt_utils.find_disk(virt_dom)
+        source_format = libvirt_utils.get_disk_type(disk_path)
+        
+        #old_disk_size = os.path.getsize(disk_path)
+        domain_name = str(domain.find('name').text)
+        fileutils.ensure_tree(CONF.libvirt.backup_path)
+        name = 'backup-' + bak_info['id'] 
+        path = os.path.join(CONF.libvirt.backup_path, name)
+
+    
+        # Abort is an idempotent operation, so make sure any block
+        # jobs which may have failed are ended.
+        try:
+            virt_dom.blockJobAbort(disk_path, 0)
+        except Exception:
+            pass
+        
+
+        # NOTE (rmk): We are using shallow rebases as a workaround to a bug
+        #             in QEMU 1.3. In order to do this, we need to create
+        #             a destination image with the original backing file
+        #             and matching size of the instance root disk.
+        src_disk_size = libvirt_utils.get_disk_size(disk_path)
+        src_back_path = libvirt_utils.get_disk_backing_file(disk_path,
+                                                            basename=False)
+
+        libvirt_utils.create_cow_image(src_back_path, path,
+                                       src_disk_size)
+        utils.execute('chmod', '777', path, run_as_root=True)
+
+        try:
+
+            # NOTE (rmk): Establish a temporary mirror of our root disk and
+            #             issue an abort once we have a complete copy.
+            utils.execute('virsh', 'qemu-monitor-command', domain_name, '--hmp',
+                          'drive_backup', '-n', 'drive-virtio-disk0', path,
+                          run_as_root=True, attempts=3)
+
+            while self._wait_for_dom_block_job(instance['uuid']):
+                time.sleep(0.5)
+            utils.execute('chmod', '777', path, run_as_root=True)
+        except Exception as e:
+            LOG.error(e)
+            raise exception.InstanceBackupCreateFailed(
+                instance_uuid=instance['uuid'],
+                backup_id=bak_info['id'])
+
+        new_disk_size = os.path.getsize(path)
+        res = {'path': path, 'size': new_disk_size}
+        return res
+
+    def backup2_resume_instance(self, context, instance, bak_info):     
+        try:
+            virt_dom = self._lookup_by_name(instance['name'])
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning()
+
+        size = bak_info['backup_size']
+        path = bak_info['backup_path']
+        
+        assert size > 0 and path is not None
+        
+        file_size = libvirt_utils.get_disk_size(path)
+        disk_path = libvirt_utils.find_disk(virt_dom)
+        source_format = libvirt_utils.get_disk_type(disk_path)
+
+        disk_path_last = disk_path + '.last'
+        utils.execute('mv', '-f', disk_path, disk_path_last)
+        libvirt_utils.copy_image(path, disk_path)
+        utils.flush_page_cache()
+
+
+    def backup2_delete(self, instance, bak_info):
+        bak_dir = bak_info['backup_path']
+        if not bak_dir:
+            bak_dir_if_error = os.path.join(CONF.libvirt.backup_path, 'backup-'+bak_info['id'])
+            utils.execute('rm', '-f', bak_dir_if_error)
+            LOG.error("backup_file's path is None")
+            return  
+        if not os.path.exists(bak_dir):
+            LOG.error("backup_file is not exists")
+            return  
+        utils.execute('rm', '-f', bak_dir)
+        
+        if not os.path.exists(bak_dir):
+            LOG.debug("+++ Delete Result: succeed +++") 
+        else:
+            LOG.error("+++ Delete Result: failed +++")
+            raise exception.InstanceBackupDeleteFailed(
+                backup_id=bak_info['id'])
+    
+    def backup2_to_image(self, context, instance, bak_info, ori_image_id):
+        path = bak_info['backup_path']
+        size = bak_info['backup_size']
+        assert path is not None and size > 0
+        
+        (image_service, image_id) = glance.get_remote_image_service(
+            context, ori_image_id)
+
+        base = compute_utils.get_image_metadata(
+            context, image_service, image_id, instance)
+        image_href = image_id
+
+        _image_service = glance.get_remote_image_service(context, image_href)
+        snapshot_image_service, snapshot_image_id = _image_service
+        snapshot = snapshot_image_service.show(context, snapshot_image_id)
+
+        metadata = {
+                    'is_public': True,
+                    'status': 'active',
+                    'name': snapshot['name'],
+                    'properties': {
+                                   'kernel_id': instance['kernel_id'],
+                                   'image_location': 'snapshot',
+                                   'image_state': 'available',
+                                   'owner_id': instance['project_id'],
+                                   'ramdisk_id': instance['ramdisk_id'],
+                                   'os_type': instance['os_type'],
+                                   }
+                    }
+
+        #disk_path = libvirt_utils.find_disk(virt_dom)
+        #source_format = libvirt_utils.get_disk_type(disk_path)
+        image_format = CONF.libvirt.snapshot_image_format or 'raw'
+        # NOTE(bfilippov): save lvm and rbd as raw
+        if image_format == 'lvm' or image_format == 'rbd':
+            image_format = 'raw'
+
+        snapshot_name = uuid.uuid4().hex
+        snapshot_directory = CONF.libvirt.snapshots_directory
+        fileutils.ensure_tree(snapshot_directory)
+        
+        with utils.tempdir(dir=snapshot_directory) as tmpdir:
+            try:
+                utils.execute('chmod', '777', tmpdir, run_as_root=True)
+                out_path = os.path.join(tmpdir, snapshot_name)
+                libvirt_utils.extract_snapshot(path, 'qcow2', out_path, image_format)
+            except Exception, e:
+                LOG.error(e)
+                LOG.error(_("backup image upload failed"),
+                         instance=instance)
+                return
+
+            
+            with libvirt_utils.file_open(out_path) as image_file:
+                LOG.info(_("backup image upload beging"),
+                         instance=instance)
+                image_service.update(context,
+                                     image_href,
+                                     metadata,
+                                     image_file)
+                LOG.info(_("backup image upload complete"),
+                         instance=instance)
+
 
 
 class HostState(object):

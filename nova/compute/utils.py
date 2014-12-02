@@ -312,7 +312,7 @@ def notify_usage_exists(notifier, context, instance_ref, current_period=False,
 
 def notify_about_instance_usage(notifier, context, instance, event_suffix,
                                 network_info=None, system_metadata=None,
-                                extra_usage_info=None, fault=None):
+                                extra_usage_info=None, fault=None, backup_uuid=None):
     """Send a notification about an instance.
 
     :param notifier: a messaging.Notifier
@@ -328,6 +328,10 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
 
     usage_info = notifications.info_from_instance(context, instance,
             network_info, system_metadata, **extra_usage_info)
+    
+    if backup_uuid:
+        usage_info["backup_uuid"] = backup_uuid
+
 
     if fault:
         # NOTE(johngarbutt) mirrors the format in wrap_exception

@@ -1193,7 +1193,10 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             os.append(self._text_node("init", self.os_init_path))
 
         for boot_dev in self.os_boot_dev:
+            if boot_dev != 'hd':
+                os.append(etree.Element("boot", dev='hd'))
             os.append(etree.Element("boot", dev=boot_dev))
+            #os.append(etree.Element("boot", dev='hd'))
 
         if self.os_smbios is not None:
             os.append(self.os_smbios.format_dom())

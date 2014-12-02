@@ -67,7 +67,8 @@ class BaseFilterHandler(loadables.BaseLoader):
     def get_filtered_objects(self, filter_classes, objs,
             filter_properties, index=0):
         list_objs = list(objs)
-        LOG.debug(_("Starting with %d host(s)"), len(list_objs))
+        LOG.info(_("Starting with %d host(s)"), len(list_objs))
+        LOG.info(list_objs)
         for filter_cls in filter_classes:
             cls_name = filter_cls.__name__
             filter = filter_cls()

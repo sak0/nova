@@ -162,6 +162,14 @@ class LibvirtGenericVIFDriver(LibvirtBaseVIFDriver):
 
     def get_config_bridge(self, instance, vif, image_meta, inst_type):
         """Get VIF configurations for bridge type."""
+
+        bandwidth_tx = vif.get("bandwidth_tx")
+        bandwidth_rx = vif.get("bandwidth_rx")
+        if bandwidth_tx > 0:
+            inst_type["extra_specs"]["quota:vif_outbound_average"] = bandwidth_tx
+        if bandwidth_rx > 0:
+            inst_type["extra_specs"]["quota:vif_inbound_average"] = bandwidth_rx
+            
         conf = super(LibvirtGenericVIFDriver,
                      self).get_config(instance, vif,
                                       image_meta, inst_type)

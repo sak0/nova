@@ -28,10 +28,11 @@ authorize = extensions.extension_authorizer('compute', 'evacuate')
 
 
 class Controller(wsgi.Controller):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, ext_mgr, *args, **kwargs):
         super(Controller, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
         self.host_api = compute.HostAPI()
+        self.ext_mgr = ext_mgr
 
     @wsgi.action('evacuate')
     def _evacuate(self, req, id, body):
@@ -46,9 +47,13 @@ class Controller(wsgi.Controller):
         evacuate_body = body["evacuate"]
 
         try:
-            host = evacuate_body["host"]
+            host = evacuate_body.get("host")
             on_shared_storage = strutils.bool_from_string(
                                             evacuate_body["onSharedStorage"])
+            if (not host and
+                not self.ext_mgr.is_loaded('os-extended-evacuate-find-host')):
+                msg = _("host must be specified.")
+                raise exc.HTTPBadRequest(explanation=msg)
         except (TypeError, KeyError):
             msg = _("host and onSharedStorage must be specified.")
             raise exc.HTTPBadRequest(explanation=msg)
@@ -64,12 +69,13 @@ class Controller(wsgi.Controller):
             password = evacuate_body['adminPass']
         elif not on_shared_storage:
             password = utils.generate_password()
-
-        try:
-            self.host_api.service_get_by_compute_host(context, host)
-        except exception.NotFound:
-            msg = _("Compute host %s not found.") % host
-            raise exc.HTTPNotFound(explanation=msg)
+            
+        if host is not None:
+            try:
+                self.host_api.service_get_by_compute_host(context, host)
+            except exception.NotFound:
+                msg = _("Compute host %s not found.") % host
+                raise exc.HTTPNotFound(explanation=msg)
 
         try:
             instance = self.compute_api.get(context, id)
@@ -96,6 +102,6 @@ class Evacuate(extensions.ExtensionDescriptor):
     updated = "2013-01-06T00:00:00+00:00"
 
     def get_controller_extensions(self):
-        controller = Controller()
+        controller = Controller(self.ext_mgr)
         extension = extensions.ControllerExtension(self, 'servers', controller)
         return [extension]
