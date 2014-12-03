@@ -226,4 +226,5 @@ cp: CommandFilter, cp, root
 
 # nova/virt/xenapi/vm_utils.py:
 sync: CommandFilter, sync, root
-
+virsh: CommandFilter, virsh, root
+echo: CommandFilter, echo, root
